@@ -24,7 +24,13 @@ _INSTANT_RANK = 1
 
 _OFFSET_COLON = re.compile(r"(\d{2}:\d{2}(?::\d{2})?)([+-])(\d{2})(\d{2})$")
 _OFFSET_HOUR = re.compile(r"(\d{2}:\d{2}(?::\d{2})?)([+-])(\d{2})$")
-_BASIC_DATETIME = re.compile(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(.*)$")
+# Used only on what trails a fractional part, where a signed number at the end
+# can be nothing but the offset, so no clock anchor is available or needed.
+_TRAILING_OFFSET_COLON = re.compile(r"([+-])(\d{2})(\d{2})$")
+_TRAILING_OFFSET_HOUR = re.compile(r"([+-])(\d{2})$")
+_BASIC_SECONDS = re.compile(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(.*)$")
+_BASIC_MINUTES = re.compile(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(.*)$")
+_BASIC_HOURS = re.compile(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(.*)$")
 _BASIC_DATE = re.compile(r"^(\d{4})(\d{2})(\d{2})(.*)$")
 
 
@@ -38,16 +44,36 @@ def _expand_offset(text: str) -> str:
     return _OFFSET_HOUR.sub(r"\1\2\3:00", text)
 
 
+def _expand_trailing_offset(text: str) -> str:
+    """Widen the offset at the end of an already-split-off suffix.
+
+    After ``partition(".")`` the offset of ``...T09:00:00.5+08`` arrives here
+    as a bare ``+08`` with no clock reading in front of it, so the anchored
+    patterns cannot see it. Its position makes it unambiguous.
+    """
+    text = _TRAILING_OFFSET_COLON.sub(r"\1\2:\3", text)
+    return _TRAILING_OFFSET_HOUR.sub(r"\1\2:00", text)
+
+
 def _expand_basic_format(text: str) -> str:
     """Write an ISO-8601 *basic* (unseparated) date or datetime in extended form.
 
-    A trailing UTC offset is carried over untouched; ``_expand_offset`` runs
-    afterwards and fixes its width.
+    Precision may stop at the minute or the hour, and a trailing UTC offset
+    is carried over untouched -- ``_expand_offset`` runs afterwards and fixes
+    its width.
     """
-    match = _BASIC_DATETIME.match(text)
+    match = _BASIC_SECONDS.match(text)
     if match:
         year, month, day, hour, minute, second, rest = match.groups()
         return f"{year}-{month}-{day}T{hour}:{minute}:{second}{rest}"
+    match = _BASIC_MINUTES.match(text)
+    if match:
+        year, month, day, hour, minute, rest = match.groups()
+        return f"{year}-{month}-{day}T{hour}:{minute}:00{rest}"
+    match = _BASIC_HOURS.match(text)
+    if match:
+        year, month, day, hour, rest = match.groups()
+        return f"{year}-{month}-{day}T{hour}:00:00{rest}"
     match = _BASIC_DATE.match(text)
     if match:
         year, month, day, rest = match.groups()
@@ -75,7 +101,7 @@ def _normalise_timestamp(value: str) -> str:
         if not char.isdigit():
             break
         digits += char
-    return head + "." + (digits + "000000")[:6] + _expand_offset(tail[len(digits) :])
+    return head + "." + (digits + "000000")[:6] + _expand_trailing_offset(tail[len(digits) :])
 
 
 def _instant_key(value: Optional[str]) -> tuple:

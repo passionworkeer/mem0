@@ -283,10 +283,19 @@ class TestSQLiteManager:
         assert _normalise_timestamp("2026-01-01T09:00:00+0000") == "2026-01-01T09:00:00+00:00"
         assert _normalise_timestamp("2026-01-01T09:00:00-05") == "2026-01-01T09:00:00-05:00"
         assert _normalise_timestamp("2026-01-01T09:00:00-0500") == "2026-01-01T09:00:00-05:00"
-        # Basic (unseparated) formats.
+        # Basic (unseparated) formats, at every precision 3.11 accepts.
         assert _normalise_timestamp("20260101T090000") == "2026-01-01T09:00:00"
+        assert _normalise_timestamp("20260101T0900") == "2026-01-01T09:00:00"
+        assert _normalise_timestamp("20260101T09") == "2026-01-01T09:00:00"
         assert _normalise_timestamp("20260101T090000Z") == "2026-01-01T09:00:00+00:00"
+        assert _normalise_timestamp("20260101T0900+0800") == "2026-01-01T09:00:00+08:00"
         assert _normalise_timestamp("20260101") == "2026-01-01"
+        # A short offset that trails a fractional part arrives without a clock
+        # reading in front of it, so the anchored patterns cannot widen it.
+        assert _normalise_timestamp("2026-01-01T09:00:00.5+08") == "2026-01-01T09:00:00.500000+08:00"
+        assert _normalise_timestamp("2026-01-01T09:00:00.5+0800") == "2026-01-01T09:00:00.500000+08:00"
+        assert _normalise_timestamp("2026-01-01T09:00:00.5-05") == "2026-01-01T09:00:00.500000-05:00"
+        assert _normalise_timestamp("2026-01-01T09:00:00.123456-0500") == "2026-01-01T09:00:00.123456-05:00"
 
         canonical = _instant_key("2026-01-01T09:00:00+00:00")
         for variant in (
