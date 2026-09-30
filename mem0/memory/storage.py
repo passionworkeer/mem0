@@ -1,4 +1,5 @@
 import logging
+import re
 import sqlite3
 import threading
 import uuid
@@ -6,6 +7,108 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+# Sort keys are (rank, microseconds-since-epoch). Rank 0 is for timestamps
+# that cannot be turned into an instant, rank 1 for real ones.
+#
+# This is a behaviour change against 94c3fe9f, where the raw string
+# `ORDER BY created_at ASC` put a NULL first but a non-NULL unparseable value
+# at its lexicographic position, i.e. after the real timestamps, because
+# letters sort after digits. Both now share rank 0 and sort ahead of real
+# history. That is deliberate -- where malformed timestamps belong is still
+# an open question upstream -- so keep it stated rather than silent.
+_UNPARSEABLE_RANK = 0
+_INSTANT_RANK = 1
+
+_OFFSET_COLON = re.compile(r"(\d{2}:\d{2}(?::\d{2})?)([+-])(\d{2})(\d{2})$")
+_OFFSET_HOUR = re.compile(r"(\d{2}:\d{2}(?::\d{2})?)([+-])(\d{2})$")
+_BASIC_DATETIME = re.compile(r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(.*)$")
+_BASIC_DATE = re.compile(r"^(\d{4})(\d{2})(\d{2})(.*)$")
+
+
+def _expand_offset(text: str) -> str:
+    """Write a UTC offset as ``+HH:MM``, whatever width it arrived in.
+
+    The offset has to be anchored to a clock reading, otherwise the ``-01``
+    in a date like ``2026-01-01`` looks like a ``-01`` offset.
+    """
+    text = _OFFSET_COLON.sub(r"\1\2\3:\4", text)
+    return _OFFSET_HOUR.sub(r"\1\2\3:00", text)
+
+
+def _expand_basic_format(text: str) -> str:
+    """Write an ISO-8601 *basic* (unseparated) date or datetime in extended form.
+
+    A trailing UTC offset is carried over untouched; ``_expand_offset`` runs
+    afterwards and fixes its width.
+    """
+    match = _BASIC_DATETIME.match(text)
+    if match:
+        year, month, day, hour, minute, second, rest = match.groups()
+        return f"{year}-{month}-{day}T{hour}:{minute}:{second}{rest}"
+    match = _BASIC_DATE.match(text)
+    if match:
+        year, month, day, rest = match.groups()
+        return f"{year}-{month}-{day}{rest}"
+    return text
+
+
+def _normalise_timestamp(value: str) -> str:
+    """Rewrite an ISO-8601 string into a form every supported Python accepts.
+
+    ``datetime.fromisoformat`` only learned to read ``Z``, short offsets and
+    the *basic* (unseparated) formats in 3.11, and this project supports 3.10.
+    SQLite's date functions accept all of them, so without this the same
+    database would order the same rows differently on 3.10 than on 3.11/3.12.
+    """
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    head, dot, tail = text.partition(".")
+    head = _expand_offset(_expand_basic_format(head))
+    if not dot:
+        return head
+    digits = ""
+    for char in tail:
+        if not char.isdigit():
+            break
+        digits += char
+    return head + "." + (digits + "000000")[:6] + _expand_offset(tail[len(digits) :])
+
+
+def _instant_key(value: Optional[str]) -> tuple:
+    """Build an exact, offset-aware sort key for an ISO-8601 timestamp.
+
+    Ordering in SQL cannot be both exact and portable here. SQLite's
+    ``JULIANDAY()`` keeps only three fractional digits, so two records inside
+    the same millisecond collapse onto one key, and the double it returns
+    costs another ~40 microseconds on top at present-day magnitudes. Neither
+    SQL workaround is usable either:
+
+    * ``strftime(..., 'utc')`` keeps full seconds but reinterprets a naive
+      value as local time, so a naive ``09:00`` and an explicit ``01:00+00:00``
+      stop comparing as the same moment;
+    * ``CAST(substr(ts, 20) AS REAL)`` reads the offset instead of the
+      fraction -- it returns ``8.0`` for a ``+08:00`` suffix.
+
+    So the ordering is computed here on integer microseconds. Naive values are
+    read as UTC, which is what ``DATETIME()`` already did, so existing rows
+    keep their relative order.
+    """
+    if not value:
+        return (_UNPARSEABLE_RANK, 0)
+    try:
+        moment = datetime.fromisoformat(_normalise_timestamp(value))
+    except (AttributeError, TypeError, ValueError):
+        logger.debug("history: unparseable timestamp %r, sorted ahead of real history", value)
+        return (_UNPARSEABLE_RANK, 0)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    delta = moment - _EPOCH
+    micros = (delta.days * 86_400_000_000) + (delta.seconds * 1_000_000) + delta.microseconds
+    return (_INSTANT_RANK, micros)
 
 
 class SQLiteManager:
@@ -232,14 +335,21 @@ class SQLiteManager:
                        created_at, updated_at, is_deleted, actor_id, role
                 FROM history
                 WHERE memory_id = ?
-                ORDER BY
-                    JULIANDAY(created_at) ASC,
-                    JULIANDAY(updated_at) ASC,
-                    created_at ASC
+                ORDER BY created_at ASC, updated_at ASC, rowid ASC
             """,
                 (memory_id,),
             )
             rows = cur.fetchall()
+
+        # created_at first, then updated_at to break ties between writes that
+        # share a created_at. The SQL ordering above is only the final
+        # tiebreak: list.sort is stable, so rows whose instant keys are exactly
+        # equal keep it, and `rowid` makes even a full tie resolve to insertion
+        # order -- SQLite does not promise a stable sort for one otherwise.
+        # Rows that the old DATETIME(updated_at) tied -- it truncates to the
+        # second -- but that differ sub-second are now separated, which is the
+        # point of this change.
+        rows.sort(key=lambda row: (_instant_key(row[5]), _instant_key(row[6])))
 
         return [
             {

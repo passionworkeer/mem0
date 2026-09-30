@@ -218,9 +218,8 @@ class TestSQLiteManager:
 
         A bare string comparison is a lexicographic one, so
         ``...T09:00:00+00:00`` sorts before ``...T10:00:00+08:00`` even
-        though the second happened five hours earlier. updated_at already
-        goes through SQLite's DATETIME(); created_at must use the same
-        rule or the audit trail reads out of causal order.
+        though the second happened five hours earlier. Ordering therefore
+        has to go through the instant, not through the text.
         """
         utc_morning = "2026-01-01T09:00:00+00:00"  # 09:00 UTC -- latest
         shanghai_morning = "2026-01-01T10:00:00+08:00"  # 02:00 UTC -- earliest
@@ -259,6 +258,126 @@ class TestSQLiteManager:
         )
         assert result[-1]["created_at"] == utc_morning
 
+    def test_instant_key_normalises_iso_variants_python_310_can_read(self):
+        """ISO spellings that only Python 3.11+ parses must still compare equal.
+
+        The package supports 3.10 and CI runs a 3.10/3.11/3.12 matrix, where
+        ``fromisoformat`` rejects a ``Z`` suffix, a short offset and the basic
+        unseparated formats, while SQLite accepts all of them. Without
+        normalisation those rows would sort as "unparseable" on 3.10 only, so
+        one database would order the same rows differently per interpreter.
+        """
+        from mem0.memory.storage import (
+            _UNPARSEABLE_RANK,
+            _instant_key,
+            _normalise_timestamp,
+        )
+
+        assert _normalise_timestamp("2026-01-01T09:00:00Z") == "2026-01-01T09:00:00+00:00"
+        assert _normalise_timestamp("2026-01-01T09:00:00.5") == "2026-01-01T09:00:00.500000"
+        assert _normalise_timestamp("2026-01-01T09:00:00.123456789") == "2026-01-01T09:00:00.123456"
+        assert _normalise_timestamp("2026-01-01T09:00:00.5+08:00") == "2026-01-01T09:00:00.500000+08:00"
+        assert _normalise_timestamp("2026-01-01T09:00:00") == "2026-01-01T09:00:00"
+        # Offsets in the three widths 3.11 accepts.
+        assert _normalise_timestamp("2026-01-01T09:00:00+00") == "2026-01-01T09:00:00+00:00"
+        assert _normalise_timestamp("2026-01-01T09:00:00+0000") == "2026-01-01T09:00:00+00:00"
+        assert _normalise_timestamp("2026-01-01T09:00:00-05") == "2026-01-01T09:00:00-05:00"
+        assert _normalise_timestamp("2026-01-01T09:00:00-0500") == "2026-01-01T09:00:00-05:00"
+        # Basic (unseparated) formats.
+        assert _normalise_timestamp("20260101T090000") == "2026-01-01T09:00:00"
+        assert _normalise_timestamp("20260101T090000Z") == "2026-01-01T09:00:00+00:00"
+        assert _normalise_timestamp("20260101") == "2026-01-01"
+
+        canonical = _instant_key("2026-01-01T09:00:00+00:00")
+        for variant in (
+            "2026-01-01T09:00:00Z",
+            "2026-01-01T09:00:00+00",
+            "2026-01-01T09:00:00+0000",
+            "2026-01-01 09:00:00",
+            "20260101T090000",
+            "20260101T090000Z",
+        ):
+            assert _instant_key(variant) == canonical, variant
+        assert _instant_key("2026-01-01T09:00:00.5") == _instant_key("2026-01-01T09:00:00.500000")
+        assert _instant_key("2026-01-01T01:00:00-08:00") == canonical
+        # Genuinely malformed input must still land in the unparseable rank.
+        assert _instant_key("not-a-date") == (_UNPARSEABLE_RANK, 0)
+
+    @pytest.mark.parametrize("insertion_order", [("later", "earlier"), ("earlier", "later")])
+    def test_get_history_orders_microsecond_apart_records(
+        self,
+        sqlite_manager,
+        sample_data,
+        insertion_order,
+    ):
+        """Two records one microsecond apart must order by real instant.
+
+        ``JULIANDAY()`` returns a double, and at present-day magnitudes
+        (year 2026 -> ~2461041.58) one ULP is about 40 microseconds. Records
+        a microsecond apart therefore collapse onto the same key, the
+        ordering falls through to a raw string comparison, and the result
+        depends on how the rows happened to be written.
+
+        Verified with an independent timezone-aware oracle: ``earlier`` is
+        02:00:00.000001Z and ``later`` is 02:00:00.000002Z, so ``earlier``
+        must come first no matter which order they were inserted in.
+        """
+        moments = {
+            # Same instant spelled two ways, one microsecond apart.
+            "earlier": "2026-01-01T10:00:00.000001+08:00",  # 02:00:00.000001Z
+            "later": "2026-01-01T02:00:00.000002+00:00",  # 02:00:00.000002Z
+        }
+        for event in insertion_order:
+            sqlite_manager.add_history(
+                memory_id=sample_data["memory_id"],
+                old_memory=None,
+                new_memory=event,
+                event=event,
+                created_at=moments[event],
+                updated_at=None,
+            )
+
+        result = sqlite_manager.get_history(sample_data["memory_id"])
+
+        assert [r["event"] for r in result] == ["earlier", "later"], (
+            f"inserted as {insertion_order}, got {[(r['created_at'], r['event']) for r in result]}"
+        )
+
+    @pytest.mark.parametrize("insertion_order", [("later", "earlier"), ("earlier", "later")])
+    def test_get_history_orders_equal_created_at_by_updated_instant(
+        self,
+        sqlite_manager,
+        sample_data,
+        insertion_order,
+    ):
+        """Identical created_at must fall back to updated_at, not to row order.
+
+        When two writes share a created_at, the only thing that separates
+        them is updated_at. If that comparison also ties, the result is
+        whatever SQLite happens to return, which makes the audit trail
+        depend on insertion order.
+        """
+        created = "2026-01-01T02:05:00+00:00"
+        moments = {
+            "earlier": "2026-01-01T02:05:00.000001+00:00",
+            "later": "2026-01-01T02:05:00.000002+00:00",
+        }
+        for event in insertion_order:
+            sqlite_manager.add_history(
+                memory_id=sample_data["memory_id"],
+                old_memory=None,
+                new_memory=event,
+                event=event,
+                created_at=created,
+                updated_at=moments[event],
+            )
+
+        result = sqlite_manager.get_history(sample_data["memory_id"])
+
+        assert [r["event"] for r in result] == ["earlier", "later"], (
+            f"inserted as {insertion_order}, got {[(r['updated_at'], r['event']) for r in result]}"
+        )
+
     def test_get_history_keeps_subsecond_order(
         self,
         sqlite_manager,
@@ -266,10 +385,9 @@ class TestSQLiteManager:
     ):
         """Records inside the same second stay in sub-second order.
 
-        ``DATETIME()`` truncates the fraction, so ordering by it alone
-        would tie every record written within one second and leave the
-        result up to SQLite. ``JULIANDAY()`` keeps the fraction, and the
-        raw string is the final tiebreak for anything unparseable.
+        Any ordering that truncates the fraction -- SQLite's DATETIME()
+        does -- would tie every record written within one second and leave
+        the result up to the engine. This guards against that coming back.
         """
         moments = [
             ("late", "2026-01-01T09:00:00.900000"),
