@@ -198,7 +198,7 @@ class TestSQLiteManager:
             sqlite_manager.add_history(
                 memory_id=sample_data["memory_id"],
                 old_memory=f"Memory {i}",
-                new_memory=f"Memory {i+1}",
+                new_memory=f"Memory {i + 1}",
                 event="ADD" if i == 0 else "UPDATE",
                 created_at=ts,
                 updated_at=ts if i > 0 else None,
@@ -208,6 +208,138 @@ class TestSQLiteManager:
         result = sqlite_manager.get_history(sample_data["memory_id"])
         result_timestamps = [r["created_at"] for r in result]
         assert result_timestamps == sorted(timestamps)
+
+    def test_get_history_orders_mixed_utc_offsets_by_instant(
+        self,
+        sqlite_manager,
+        sample_data,
+    ):
+        """created_at values with different UTC offsets sort by real instant.
+
+        A bare string comparison is a lexicographic one, so
+        ``...T09:00:00+00:00`` sorts before ``...T10:00:00+08:00`` even
+        though the second happened five hours earlier. updated_at already
+        goes through SQLite's DATETIME(); created_at must use the same
+        rule or the audit trail reads out of causal order.
+        """
+        utc_morning = "2026-01-01T09:00:00+00:00"  # 09:00 UTC -- latest
+        shanghai_morning = "2026-01-01T10:00:00+08:00"  # 02:00 UTC -- earliest
+
+        sqlite_manager.add_history(
+            memory_id=sample_data["memory_id"],
+            old_memory=None,
+            new_memory="Memory 1",
+            event="ADD",
+            created_at=shanghai_morning,
+            updated_at=None,
+        )
+        sqlite_manager.add_history(
+            memory_id=sample_data["memory_id"],
+            old_memory="Memory 1",
+            new_memory="Memory 2",
+            event="UPDATE",
+            created_at=shanghai_morning,
+            updated_at=shanghai_morning,
+        )
+        sqlite_manager.add_history(
+            memory_id=sample_data["memory_id"],
+            old_memory="Memory 2",
+            new_memory="Memory 3",
+            event="UPDATE",
+            created_at=utc_morning,
+            updated_at=utc_morning,
+        )
+
+        result = sqlite_manager.get_history(sample_data["memory_id"])
+        events = [r["event"] for r in result]
+
+        # 02:00 UTC ADD, 02:00 UTC UPDATE, then 09:00 UTC UPDATE.
+        assert events == ["ADD", "UPDATE", "UPDATE"], (
+            f"audit trail out of causal order: {[(r['created_at'], r['event']) for r in result]}"
+        )
+        assert result[-1]["created_at"] == utc_morning
+
+    def test_get_history_keeps_subsecond_order(
+        self,
+        sqlite_manager,
+        sample_data,
+    ):
+        """Records inside the same second stay in sub-second order.
+
+        ``DATETIME()`` truncates the fraction, so ordering by it alone
+        would tie every record written within one second and leave the
+        result up to SQLite. ``JULIANDAY()`` keeps the fraction, and the
+        raw string is the final tiebreak for anything unparseable.
+        """
+        moments = [
+            ("late", "2026-01-01T09:00:00.900000"),
+            ("early", "2026-01-01T09:00:00.100000"),
+            ("middle", "2026-01-01T09:00:00.500000"),
+            ("sub_ms", "2026-01-01T09:00:00.100500"),
+        ]
+        for event, created_at in moments:
+            sqlite_manager.add_history(
+                memory_id=sample_data["memory_id"],
+                old_memory=None,
+                new_memory=event,
+                event=event,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+
+        result = sqlite_manager.get_history(sample_data["memory_id"])
+        assert [r["event"] for r in result] == [
+            "early",
+            "sub_ms",
+            "middle",
+            "late",
+        ]
+
+    def test_get_history_tolerates_equal_instants(
+        self,
+        sqlite_manager,
+        sample_data,
+    ):
+        """Two spellings of the same instant must not raise or duplicate."""
+        for event, created_at in (
+            ("utc", "2026-01-01T12:00:00+00:00"),
+            ("offset", "2026-01-01T20:00:00+08:00"),
+        ):
+            sqlite_manager.add_history(
+                memory_id=sample_data["memory_id"],
+                old_memory=None,
+                new_memory=event,
+                event=event,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+
+        result = sqlite_manager.get_history(sample_data["memory_id"])
+        assert sorted(r["event"] for r in result) == ["offset", "utc"]
+
+    def test_get_history_handles_missing_and_unparseable_created_at(
+        self,
+        sqlite_manager,
+        sample_data,
+    ):
+        """Rows without a usable created_at must not break the query."""
+        for event, created_at in (
+            ("missing", None),
+            ("garbage", "not-a-date"),
+            ("real", "2026-01-01T09:00:00+00:00"),
+        ):
+            sqlite_manager.add_history(
+                memory_id=sample_data["memory_id"],
+                old_memory=None,
+                new_memory=event,
+                event=event,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+
+        result = sqlite_manager.get_history(sample_data["memory_id"])
+        assert len(result) == 3
+        assert result[-1]["event"] == "real"
 
     def test_migration_preserves_data(self, temp_db_path, sample_data):
         """Test that migration preserves existing data."""
