@@ -48,22 +48,23 @@ class OpenAILLM(LLMBase):
         # change between construction and the first call.
         self._uses_openrouter = uses_openrouter
 
-        # When OpenRouter fallback routing is configured, `models` is the ordered
-        # candidate list and its first entry is what the request asks for. Resolve
-        # it here rather than at request time so that reasoning-model
-        # classification and parameter filtering (both keyed on `config.model`)
-        # see the same model the request will actually carry. An explicitly
-        # configured `model` still wins, which matches OpenRouter's own
-        # semantics: `model` is the primary and `models` the fallbacks.
-        # Copy before assigning — `LLMBase` keeps the caller's config object, and
-        # a config reused for a second client under a different provider must not
-        # inherit the OpenRouter primary.
-        if uses_openrouter and self.config.models and not self.config.model:
-            self.config = copy.copy(self.config)
-            self.config.model = self.config.models[0]
-
+        # Fill in the model this client is going to ask for. When OpenRouter
+        # fallback routing is configured, `models` is the ordered candidate list
+        # and its first entry is the primary; resolving it here rather than at
+        # request time keeps reasoning-model classification and parameter
+        # filtering (both keyed on `config.model`) in sync with what is actually
+        # sent. An explicitly configured `model` still wins, matching OpenRouter's
+        # own semantics: `model` is the primary and `models` the fallbacks.
+        #
+        # Copy before assigning: `LLMBase` keeps the caller's config object, and
+        # stamping any model into it would leak into a second client built from
+        # the same config -- including making that client skip this resolution.
         if not self.config.model:
-            self.config.model = "gpt-5-mini"
+            self.config = copy.copy(self.config)
+            if uses_openrouter and self.config.models:
+                self.config.model = self.config.models[0]
+            else:
+                self.config.model = "gpt-5-mini"
 
         if uses_openrouter:  # Use OpenRouter
             self.client = OpenAI(
