@@ -464,3 +464,59 @@ def test_openai_llm_preserves_proxies_from_base_config(mock_openai_client):
     llm = OpenAILLM(config)
     assert llm.config.http_client_proxies == "http://proxy.local:8080"
     assert isinstance(llm.config.http_client, httpx.Client)
+
+
+# The parameter dict is inspected directly, so these need no client, no network
+# and no API key -- only that `mem0` is imported from this working tree.
+
+_REQUEST_SHAPING_KWARGS = {
+    "extra_body": {"provider": {"sort": "price"}},
+    "extra_headers": {"X-Trace": "1"},
+    "parallel_tool_calls": False,
+    "seed": 7,
+}
+
+
+def test_reasoning_model_keeps_request_shaping_kwargs():
+    """Caller kwargs that are not sampling params must survive the reasoning filter.
+
+    `_get_supported_params` used to rebuild the dict from a five-key whitelist for
+    reasoning models, so everything else the caller passed was dropped silently --
+    including OpenRouter `extra_body`, which carries provider-routing preferences.
+    The non-reasoning branch keeps them all, so the two branches should not
+    disagree about which kwargs survive, only about which model parameters go.
+    See https://github.com/mem0ai/mem0/issues/7522
+    """
+    for model in ("o3-mini", "gpt-5"):
+        llm = OpenAILLM(OpenAIConfig(model=model))
+        kept = llm._get_supported_params(
+            messages=[{"role": "user", "content": "hi"}], **_REQUEST_SHAPING_KWARGS
+        )
+        for key, value in _REQUEST_SHAPING_KWARGS.items():
+            assert kept.get(key) == value, f"{model} dropped {key}"
+
+
+def test_reasoning_model_still_drops_sampling_params():
+    """The filter's actual job stays: reasoning models reject these."""
+    for model in ("o3-mini", "gpt-5"):
+        llm = OpenAILLM(OpenAIConfig(model=model, reasoning_effort="low"))
+        kept = llm._get_supported_params(
+            messages=[{"role": "user", "content": "hi"}],
+            temperature=0.5,
+            top_p=0.9,
+            max_tokens=128,
+            max_completion_tokens=128,
+        )
+        assert kept["reasoning_effort"] == "low"
+        for key in ("temperature", "top_p", "max_tokens", "max_completion_tokens"):
+            assert key not in kept, f"{model} should not receive {key}"
+        assert kept["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_reasoning_and_non_reasoning_agree_on_caller_kwargs():
+    """Same call, same kwargs: only the sampling params should differ."""
+    kwargs = dict(messages=[{"role": "user", "content": "hi"}], **_REQUEST_SHAPING_KWARGS)
+    plain = OpenAILLM(OpenAIConfig(model="gpt-4.1-nano-2025-04-14"))._get_supported_params(**dict(kwargs))
+    reasoning = OpenAILLM(OpenAIConfig(model="o3-mini"))._get_supported_params(**dict(kwargs))
+    assert set(kwargs) - set(plain) == set()
+    assert set(kwargs) - set(reasoning) == set()

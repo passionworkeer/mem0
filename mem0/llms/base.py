@@ -10,6 +10,12 @@ class LLMBase(ABC):
     Handles common functionality and delegates provider-specific logic to subclasses.
     """
 
+    # Model-level parameters that reasoning models reject. Everything else a
+    # caller passes is request shaping, not sampling, and is left alone.
+    _REASONING_UNSUPPORTED_PARAMS = frozenset(
+        {"temperature", "top_p", "max_tokens", "max_completion_tokens"}
+    )
+
     def __init__(self, config: Optional[Union[BaseLlmConfig, Dict]] = None):
         """Initialize a base LLM class
 
@@ -97,26 +103,28 @@ class LLMBase(ABC):
         """
         Get parameters that are supported by the current model.
         Filters out unsupported parameters for reasoning models and GPT-5 series.
-        
+
         Args:
             **kwargs: Additional parameters to include
-            
+
         Returns:
             Dict: Filtered parameters dictionary
         """
         model = getattr(self.config, 'model', '')
-        
+
         if self._is_reasoning_model(model):
-            supported_params = {}
-            
-            if "messages" in kwargs:
-                supported_params["messages"] = kwargs["messages"]
-            if "response_format" in kwargs:
-                supported_params["response_format"] = kwargs["response_format"]
-            if "tools" in kwargs:
-                supported_params["tools"] = kwargs["tools"]
-            if "tool_choice" in kwargs:
-                supported_params["tool_choice"] = kwargs["tool_choice"]
+            # Start from the caller's kwargs so request-shaping options survive
+            # (`extra_body`, `extra_headers`, `seed`, `parallel_tool_calls`, ...),
+            # and drop only the model-level sampling parameters that reasoning
+            # models reject. This used to rebuild the dict from a five-key
+            # whitelist, which silently discarded every other kwarg too — so the
+            # two branches disagreed about which kwargs survive, and OpenRouter
+            # users lost their provider-routing preferences on a reasoning model.
+            # See https://github.com/mem0ai/mem0/issues/7522
+            supported_params = {
+                key: value for key, value in kwargs.items()
+                if key not in self._REASONING_UNSUPPORTED_PARAMS
+            }
 
             # Add reasoning_effort if configured
             reasoning_effort = getattr(self.config, 'reasoning_effort', None)
