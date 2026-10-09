@@ -777,3 +777,29 @@ def test_openrouter_does_not_mutate_caller_config(monkeypatch):
     assert llm.config.model == "openai/o3-mini"
     assert config.model is None
     assert llm.config is not config
+
+
+def test_default_model_does_not_mutate_caller_config_either(monkeypatch):
+    """The `gpt-5-mini` fallback must not leak either — in either order.
+
+    If the default were stamped into the caller's config, a later client built
+    from the same config with `OPENROUTER_API_KEY` set would see a truthy
+    `model`, skip the `models` resolution, and ask OpenRouter for `gpt-5-mini`.
+    """
+    captured = []
+    monkeypatch.setattr("mem0.llms.openai.OpenAI", _openrouter_client_factory(captured))
+
+    config = OpenAIConfig(models=["openai/o3-mini", "openai/gpt-4o-mini"])
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    first = OpenAILLM(config)
+    assert first.config.model == "gpt-5-mini"
+    assert config.model is None
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    second = OpenAILLM(config)
+    assert second.config.model == "openai/o3-mini"
+    assert config.model is None
+
+    assert second.generate_response([{"role": "user", "content": "ping"}]) == "pong"
+    assert json.loads(captured[0].content)["model"] == "openai/o3-mini"
