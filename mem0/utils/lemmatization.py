@@ -39,11 +39,16 @@ def lemmatize_for_bm25(text: str) -> str:
             continue
 
         lemma = token.lemma_
-        if lemma.isalnum():
+        # Needs one alphanumeric character, not nothing but them: spaCy keeps
+        # "gpt-4" whole, so isalnum() dropped the most frequent terms of a
+        # store about model usage. Bare symbols such as "$" still stay out.
+        if any(character.isalnum() for character in lemma):
             tokens.append(lemma)
 
         # Also add original if it ends in -ing and differs from lemma.
         # This handles noun/verb ambiguity (meeting/meet, attending/attend).
+        # Unlike the guard above this one still needs a fully alphanumeric
+        # token: spaCy splits on hyphens, so "foo-ing" arrives as "ing".
         if token.text.endswith("ing") and token.text != lemma and token.text.isalnum():
             tokens.append(token.text)
 

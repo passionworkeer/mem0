@@ -65,3 +65,41 @@ class TestLemmatizeForBm25:
         tokens = result.split()
         for stop in ["this", "is", "a", "very", "of", "the"]:
             assert stop not in tokens
+
+    def test_model_names_and_version_numbers_kept(self):
+        """Model names carry a hyphen, so their lemma is not ``str.isalnum``.
+
+        Dropping them removes the highest-frequency search terms from a memory
+        store about model usage. See mem0ai/mem0#7631.
+        """
+        from mem0.utils.lemmatization import lemmatize_for_bm25
+
+        tokens = lemmatize_for_bm25("I use GPT-4 and COVID-19 data").split()
+
+        assert "gpt-4" in tokens
+        assert "covid-19" in tokens
+        assert "datum" in tokens
+
+    def test_hyphenated_identifiers_kept(self):
+        from mem0.utils.lemmatization import lemmatize_for_bm25
+
+        tokens = lemmatize_for_bm25("we migrated to mixtral-8x7b and gpt-4o").split()
+
+        assert "mixtral-8x7b" in tokens
+        assert "gpt-4o" in tokens
+
+    def test_symbol_only_tokens_still_removed(self):
+        """Keeping hyphenated terms must not become keeping bare symbols.
+
+        ``str.isalnum()`` was the only thing rejecting a lemma such as ``$``,
+        which spaCy reports as a non-punctuation token, so the fix keeps a term
+        only when it carries at least one alphanumeric character.
+        """
+        from mem0.utils.lemmatization import lemmatize_for_bm25
+
+        tokens = lemmatize_for_bm25("he said $ 50 # 7 @ home").split()
+
+        assert "$" not in tokens
+        assert "50" in tokens
+        assert "7" in tokens
+        assert "home" in tokens
