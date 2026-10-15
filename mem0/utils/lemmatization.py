@@ -39,7 +39,14 @@ def lemmatize_for_bm25(text: str) -> str:
             continue
 
         lemma = token.lemma_
-        if lemma.isalnum():
+        # A hyphen makes str.isalnum() False, and spaCy hands model names back
+        # whole ("gpt-4"), so the plain check dropped the highest-frequency terms
+        # of a store about model usage. A hyphenated token stays one term:
+        # splitting on the hyphen would emit a bare "4" that collides with every
+        # other number in the corpus and wrecks its IDF. The test admits any
+        # hyphen plus one alphanumeric, so tokenizer fragments like "10-" are
+        # indexed too; they are rare and BM25 weights them down. See #7631.
+        if lemma.isalnum() or lemma.replace("-", "").isalnum():
             tokens.append(lemma)
 
         # Also add original if it ends in -ing and differs from lemma.
