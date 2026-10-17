@@ -389,6 +389,76 @@ def test_telemetry_vector_store_created_when_enabled():
         assert mock_vector_store.create.call_count == 2
 
 
+def test_memory_constructs_when_telemetry_store_cannot_be_opened():
+    """A telemetry store that will not open must not break construction.
+
+    The telemetry store is created at a path derived from mem0_dir alone, so
+    every Memory on the machine shares it. Embedded Qdrant locks that folder
+    exclusively, which made a second Memory fail to construct even when the
+    user had configured two completely different stores (#7665). Telemetry is
+    opt-out and nothing reads this store, so failing to open it is not a reason
+    to refuse to build the Memory the caller actually asked for.
+    """
+    lock_error = RuntimeError(
+        "Storage folder ~/.mem0/migrations_qdrant is already accessed by "
+        "another instance of Qdrant client."
+    )
+
+    def _create(*_args, **_kwargs):
+        # First call is the user's own store, which must succeed; the second is
+        # the telemetry store, which is the one that hits the lock.
+        if _create.calls:
+            raise lock_error
+        _create.calls += 1
+        return Mock()
+
+    _create.calls = 0
+
+    with (
+        patch("mem0.memory.main.MEM0_TELEMETRY", True),
+        patch("mem0.utils.factory.EmbedderFactory") as mock_embedder,
+        patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
+        patch("mem0.utils.factory.LlmFactory") as mock_llm,
+        patch("mem0.memory.telemetry.capture_event"),
+    ):
+        mock_embedder.create.return_value = Mock()
+        mock_llm.create.return_value = Mock()
+        mock_vector_store.create.side_effect = _create
+
+        config = MemoryConfig(version="v1.1")
+        memory = Memory(config)
+
+    assert memory is not None
+    assert memory._telemetry_vector_store is None
+    assert mock_vector_store.create.call_count == 2
+
+
+def test_memory_constructs_when_telemetry_dir_cannot_be_created():
+    """Failing to create the telemetry folder must not break construction either.
+
+    The folder lives under mem0_dir, so anything already sitting at that path
+    (or a mem0_dir that cannot be written to) used to abort Memory() before the
+    store was even attempted. Same reasoning as the store itself (#7665).
+    """
+    with (
+        patch("mem0.memory.main.MEM0_TELEMETRY", True),
+        patch("mem0.utils.factory.EmbedderFactory") as mock_embedder,
+        patch("mem0.memory.main.VectorStoreFactory") as mock_vector_store,
+        patch("mem0.utils.factory.LlmFactory") as mock_llm,
+        patch("mem0.memory.telemetry.capture_event"),
+        patch("mem0.memory.main.os.makedirs", side_effect=PermissionError("read-only")),
+    ):
+        mock_embedder.create.return_value = Mock()
+        mock_llm.create.return_value = Mock()
+        mock_vector_store.create.return_value = Mock()
+
+        config = MemoryConfig(version="v1.1")
+        memory = Memory(config)
+
+    assert memory is not None
+    assert memory._telemetry_vector_store is None
+
+
 # =============================================================================
 # Input Validation Tests
 # =============================================================================

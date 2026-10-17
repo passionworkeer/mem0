@@ -513,33 +513,44 @@ class Memory(MemoryBase):
         # Entity store is initialized lazily on first use
         self._entity_store = None
 
+        # Telemetry is best-effort and its vector store is never read back,
+        # so anything that goes wrong preparing or opening it must not stop
+        # a Memory from being constructed. Embedded Qdrant takes an exclusive
+        # lock on its folder, and that folder is derived from mem0_dir alone,
+        # so it is shared by every instance on the machine: a second Memory
+        # would otherwise fail to construct over a path the user never
+        # configured (#7665). The same holds if the folder cannot be created.
         if MEM0_TELEMETRY:
-            # Create telemetry config manually to avoid deepcopy issues with thread locks
-            telemetry_config_dict = {}
-            if hasattr(self.config.vector_store.config, 'model_dump'):
-                # For pydantic models
-                telemetry_config_dict = self.config.vector_store.config.model_dump()
-            else:
-                # For other objects, manually copy common attributes
-                for attr in ['host', 'port', 'path', 'api_key', 'index_name', 'dimension', 'metric']:
-                    if hasattr(self.config.vector_store.config, attr):
-                        telemetry_config_dict[attr] = getattr(self.config.vector_store.config, attr)
+            try:
+                # Create telemetry config manually to avoid deepcopy issues with thread locks
+                telemetry_config_dict = {}
+                if hasattr(self.config.vector_store.config, 'model_dump'):
+                    # For pydantic models
+                    telemetry_config_dict = self.config.vector_store.config.model_dump()
+                else:
+                    # For other objects, manually copy common attributes
+                    for attr in ['host', 'port', 'path', 'api_key', 'index_name', 'dimension', 'metric']:
+                        if hasattr(self.config.vector_store.config, attr):
+                            telemetry_config_dict[attr] = getattr(self.config.vector_store.config, attr)
 
-            # Override collection name for telemetry
-            telemetry_config_dict['collection_name'] = "mem0migrations"
+                # Override collection name for telemetry
+                telemetry_config_dict['collection_name'] = "mem0migrations"
 
-            # Set path for file-based vector stores
-            telemetry_config = _safe_deepcopy_config(self.config.vector_store.config)
-            if self.config.vector_store.provider in ["faiss", "qdrant"]:
-                provider_path = f"migrations_{self.config.vector_store.provider}"
-                telemetry_config_dict['path'] = os.path.join(mem0_dir, provider_path)
-                os.makedirs(telemetry_config_dict['path'], exist_ok=True)
+                # Set path for file-based vector stores
+                telemetry_config = _safe_deepcopy_config(self.config.vector_store.config)
+                if self.config.vector_store.provider in ["faiss", "qdrant"]:
+                    provider_path = f"migrations_{self.config.vector_store.provider}"
+                    telemetry_config_dict['path'] = os.path.join(mem0_dir, provider_path)
+                    os.makedirs(telemetry_config_dict['path'], exist_ok=True)
 
-            # Create the config object using the same class as the original
-            telemetry_config = self.config.vector_store.config.__class__(**telemetry_config_dict)
-            self._telemetry_vector_store = VectorStoreFactory.create(
-                self.config.vector_store.provider, telemetry_config
-            )
+                # Create the config object using the same class as the original
+                telemetry_config = self.config.vector_store.config.__class__(**telemetry_config_dict)
+                self._telemetry_vector_store = VectorStoreFactory.create(
+                    self.config.vector_store.provider, telemetry_config
+                )
+            except Exception as e:
+                self._telemetry_vector_store = None
+                logger.debug(f"Telemetry vector store unavailable, continuing without it: {e}")
         if getattr(type(self.vector_store), "keyword_search", None) is VectorStoreBase.keyword_search:
             logger.warning(
                 "The '%s' vector store does not support keyword search. "
@@ -2217,14 +2228,25 @@ class AsyncMemory(MemoryBase):
                 config.reranker.config
             )
 
+        # Best-effort, same reasoning as the sync path in Memory.__init__ (#7665).
         if MEM0_TELEMETRY:
-            telemetry_config = _safe_deepcopy_config(self.config.vector_store.config)
-            telemetry_config.collection_name = "mem0migrations"
-            if self.config.vector_store.provider in ["faiss", "qdrant"]:
-                provider_path = f"migrations_{self.config.vector_store.provider}"
-                telemetry_config.path = os.path.join(mem0_dir, provider_path)
-                os.makedirs(telemetry_config.path, exist_ok=True)
-            self._telemetry_vector_store = VectorStoreFactory.create(self.config.vector_store.provider, telemetry_config)
+            try:
+                telemetry_config = _safe_deepcopy_config(self.config.vector_store.config)
+                telemetry_config.collection_name = "mem0migrations"
+                if self.config.vector_store.provider in ["faiss", "qdrant"]:
+                    provider_path = f"migrations_{self.config.vector_store.provider}"
+                    telemetry_config.path = os.path.join(mem0_dir, provider_path)
+                    os.makedirs(telemetry_config.path, exist_ok=True)
+                # Best-effort, same as the sync path above: a telemetry store that
+                # cannot be opened must not break construction (#7665).
+                try:
+                    self._telemetry_vector_store = VectorStoreFactory.create(self.config.vector_store.provider, telemetry_config)
+                except Exception as e:
+                    self._telemetry_vector_store = None
+                    logger.debug(f"Telemetry vector store unavailable, continuing without it: {e}")
+            except Exception as e:
+                self._telemetry_vector_store = None
+                logger.debug(f"Telemetry vector store unavailable, continuing without it: {e}")
 
         if getattr(type(self.vector_store), "keyword_search", None) is VectorStoreBase.keyword_search:
             logger.warning(
